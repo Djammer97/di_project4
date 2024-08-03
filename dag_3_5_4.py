@@ -10,8 +10,10 @@ import psycopg2
 
 import pandas as pd
 import json
+import requests
 
 from datetime import datetime, timedelta, date
+import time
 
 from my_libs.mongo_connect import MongoConnect
 from my_libs.json_work import *
@@ -27,6 +29,10 @@ mongo_rs = Variable.get("MONGO_DB_REPLICA_SET")
 mongo_db = Variable.get("MONGO_DB_DATABASE_NAME")
 mongo_host = Variable.get("MONGO_DB_HOST")
 mongo_connect = MongoConnect(mongo_cert_path, mongo_db_user, mongo_db_pw, mongo_host, mongo_rs, mongo_db, mongo_db)
+
+X_Nickname = 'Djammer'
+X_Cohort = '1'
+X_API_KEY = '25c27781-8fde-4b30-a22e-524044a7580f'
 
 amount_rows_per_session = 10000
 
@@ -530,18 +536,72 @@ def dm_orders_fulfill(*args, **kwargs):
 
             order_key = temp['_id']
 
+            query = """
+                SELECT courier_id
+                FROM stg.deliverysystem_deliveries
+                WHERE order_id = %(order_key)s
+            """
+
+            dest_cursor.execute(query, {
+               'order_key': order_key
+            })
+
+            courier_id_raw = dest_cursor.fetchone()[0]
+
+            query = """
+                SELECT id
+                FROM dds.dm_couriers
+                WHERE courier_id = %(courier_id_raw)s
+            """
+
+            dest_cursor.execute(query, {
+                'courier_id_raw': courier_id_raw
+            })
+
+            data = dest_cursor.fetchone()
+
+            if data:
+                courier_id = data[0]
+
+                query = """
+                    SELECT rate, sum, tip_sum
+                    FROM stg.deliverysystem_deliveries
+                    WHERE order_id = %(order_key)s
+                """
+
+                dest_cursor.execute(query, {
+                    'order_key': order_key
+                })
+
+                data = dest_cursor.fetchone()
+
+                print(data)
+
+                rate = data[0]
+                summ = data[1]
+                tip_sum = data[2]
+            else:
+                courier_id = None
+                rate = None
+                summ = None
+                tip_sum = None
+
             order_status = temp['final_status']
 
             query = """
-                INSERT INTO dds.dm_orders(user_id, restaurant_id, timestamp_id, order_key, order_status)
-                VALUES(%(user_id)s, %(restaurant_id)s, %(timestamp_id)s, %(order_key)s, %(order_status)s)
+                INSERT INTO dds.dm_orders(user_id, restaurant_id, timestamp_id, order_key, order_status, courier_id, rate, sum, tip_sum)
+                VALUES(%(user_id)s, %(restaurant_id)s, %(timestamp_id)s, %(order_key)s, %(order_status)s, %(courier_id)s, %(rate)s, %(sum)s, %(tip_sum)s)
             """
             dest_cursor.execute(query, {
                 'user_id': dm_user_id,
                 'restaurant_id': dm_restaurant_id,
                 'timestamp_id': dm_timestamp_id,
                 'order_key': order_key,
-                'order_status': order_status
+                'order_status': order_status,
+                'courier_id': courier_id, 
+                'rate': rate, 
+                'sum': summ, 
+                'tip_sum': tip_sum
             })
 
         dest_cursor.execute('SELECT MAX(update_ts) FROM stg.ordersystem_orders')
@@ -793,6 +853,347 @@ def dm_settlements_report_fulfill(*args, **kwargs):
 
         dest_connection.commit()
 
+def download_from_api_couriers_task(*args, **kwargs):
+    with psycopg2.connect(dbname=dest_conn.schema, user=dest_conn.login, password=dest_conn.password, host=dest_conn.host, port=dest_conn.port) as dest_connection:
+        dest_cursor = dest_connection.cursor()
+
+        query = """
+            TRUNCATE TABLE stg.deliverysystem_couriers
+        """
+
+        dest_cursor.execute(query)
+
+        url = 'https://d5d04q7d963eapoepsqr.apigw.yandexcloud.net/couriers'
+
+        params = {
+            'sort_field': '_id',
+            'sort_direction': 'asc',
+            'limit': 50,
+            'offset': 0
+        }
+
+        headers = {
+            'X-Nickname': X_Nickname,
+            'X-Cohort': X_Cohort,
+            'X-API-KEY': X_API_KEY
+        }
+
+        while(True):
+            r = requests.get(url=url, params=params, headers=headers)
+
+            print(len(r.json()))
+
+            if len(r.json()) == 0:
+                break
+
+            params['offset'] += 50
+
+            query = """
+                INSERT INTO stg.deliverysystem_couriers(courier_id, "name")
+                VALUES (%(courier_id)s, %(name)s)
+            """
+            for courier in r.json():
+                dest_cursor.execute(query, {
+                    'courier_id': courier['_id'],
+                    'name': courier['name']
+                })
+
+
+        dest_connection.commit()
+
+def download_from_api_deliveries_task(*args, **kwargs):
+    with psycopg2.connect(dbname=dest_conn.schema, user=dest_conn.login, password=dest_conn.password, host=dest_conn.host, port=dest_conn.port) as dest_connection:
+        dest_cursor = dest_connection.cursor()
+
+        query = """
+            SELECT workflow_settings
+            FROM stg.srv_wf_settings
+            WHERE workflow_key = 'deliveries_last_date'
+        """
+
+        dest_cursor.execute(query)
+
+        data = dest_cursor.fetchone()
+
+        if data:
+            date_from = str(data[0]['last_ts'])
+        else:
+            date_from = '2022-01-01 00:00:00'
+
+        last_ts = date_from
+
+        if len(date_from) > 19:
+            last_ts = date_from[:19]
+
+        dest_cursor.execute(query)
+
+        url = 'https://d5d04q7d963eapoepsqr.apigw.yandexcloud.net/deliveries'
+
+        params = {
+            'sort_field': '_id',
+            'from': last_ts,
+            'sort_direction': 'asc',
+            'limit': 50,
+            'offset': 0
+        }
+
+        headers = {
+            'X-Nickname': X_Nickname,
+            'X-Cohort': X_Cohort,
+            'X-API-KEY': X_API_KEY
+        }
+
+        while(True):
+            r = requests.get(url=url, params=params, headers=headers)
+
+            print(r.json())
+            print(len(r.json()))
+
+            if len(r.json()) == 0:
+                break
+
+            params['offset'] += 50
+
+            query = """
+                INSERT INTO stg.deliverysystem_deliveries(order_id, order_ts, delivery_id, courier_id, address, delivery_ts, rate, sum, tip_sum)
+                VALUES (%(order_id)s, %(order_ts)s, %(delivery_id)s, %(courier_id)s, %(address)s, %(delivery_ts)s, %(rate)s, %(sum)s, %(tip_sum)s)
+            """
+
+            for deliver in r.json():
+                if deliver['order_ts'] == date_from:
+                    continue
+                dest_cursor.execute(query, {
+                    'order_id': deliver['order_id'],
+                    'order_ts': deliver['order_ts'], 
+                    'delivery_id': deliver['delivery_id'], 
+                    'courier_id': deliver['courier_id'], 
+                    'address': deliver['address'], 
+                    'delivery_ts': deliver['delivery_ts'], 
+                    'rate': deliver['rate'], 
+                    'sum': deliver['sum'], 
+                    'tip_sum': deliver['tip_sum']
+                })
+
+            
+            last_ts = r.json()[-1]['order_ts']
+
+        query = """
+            INSERT INTO stg.srv_wf_settings(workflow_key, workflow_settings)
+            VALUES ('deliveries_last_date', %(last_ts)s)
+            ON CONFLICT (workflow_key) DO UPDATE
+            SET
+                workflow_settings = %(last_ts)s
+        """
+
+        dest_cursor.execute(query, {
+            'last_ts': json.dumps({'last_ts': last_ts})
+        })
+
+        dest_connection.commit()
+
+def dm_couriers_fulfill(*args, **kwargs):
+    with psycopg2.connect(dbname=dest_conn.schema, user=dest_conn.login, password=dest_conn.password, host=dest_conn.host, port=dest_conn.port) as dest_connection:
+        dest_cursor = dest_connection.cursor()
+
+        query = """
+            SELECT courier_id, "name"
+            FROM stg.deliverysystem_couriers
+        """
+
+        dest_cursor.execute(query)
+
+        data = dest_cursor.fetchall()
+
+        if data:
+            for one_data in data:
+                query = """
+                    INSERT INTO dds.dm_couriers(courier_id, "name")
+                    VALUES(%(courier_id)s, %(name)s)
+                    ON CONFLICT (courier_id) DO UPDATE
+                    SET
+                        name = %(name)s
+                """
+
+                print(one_data)
+
+                dest_cursor.execute(query, {
+                    'courier_id': one_data[0],
+                    'name': one_data[1]
+                })
+                
+        dest_connection.commit()
+
+def dm_courier_ledger_fulfill(*args, **kwargs):
+    with psycopg2.connect(dbname=dest_conn.schema, user=dest_conn.login, password=dest_conn.password, host=dest_conn.host, port=dest_conn.port) as dest_connection:
+        dest_cursor = dest_connection.cursor()
+
+        query = """
+            SELECT workflow_settings
+            FROM cdm.srv_wf_settings
+            WHERE workflow_key = 'dm_courier_ledger'
+        """
+
+        dest_cursor.execute(query)
+
+        init_key = dest_cursor.fetchone()
+
+        if init_key:
+
+            today = date.today()
+
+            if today.month == 1:
+                month = 12
+                year = today.year - 1
+            else:
+                month = today.month - 1
+                year = today.year
+
+            query = """
+                DELETE FROM cdm.dm_courier_ledger
+                WHERE settlement_year >= %(year)s AND settlement_month >= %(month)s
+            """
+
+            dest_cursor.execute(query, {
+                'year': year,
+                'month': month
+            })
+
+            query = """
+                INSERT INTO cdm.dm_courier_ledger(courier_id, courier_name, settlement_year, settlement_month, orders_count, 
+                orders_total_sum, rate_avg, order_processing_fee, courier_order_sum, courier_tips_sum, courier_reward_sum)
+                WITH full_table_without_order_sum AS(
+                    SELECT dmc.courier_id, dmt.year AS settlement_year, dmt.month AS settlement_month, COUNT(*) AS orders_count, 
+                    SUM(sum) AS orders_total_sum, AVG(rate) AS rate_avg, SUM(sum)*0.25 AS order_processing_fee, SUM(tip_sum) AS courier_tips_sum
+                    FROM dds.dm_orders dmo
+                    INNER JOIN dds.dm_couriers dmc ON dmo.courier_id = dmc.id 
+                    INNER JOIN dds.dm_timestamps dmt ON dmt.id = dmo.timestamp_id 
+                    WHERE dmo.courier_id IS NOT NULL AND dmt.year >= %(year)s AND dmt.month >= %(month)s
+                    GROUP BY dmc.courier_id, dmt.year, dmt.month
+                ),
+                orders_with_fee AS(
+                    SELECT dmc.courier_id, ft.settlement_year, ft.settlement_month, dmo.courier_id AS courier_id_int, dmo.sum, ft.rate_avg,
+                        CASE 
+                            WHEN ft.rate_avg < 4 AND dmo.sum * 0.05 < 100 THEN 100
+                            WHEN ft.rate_avg < 4 AND dmo.sum * 0.05 >= 100 THEN dmo.sum * 0.05
+                            WHEN ft.rate_avg < 4.5 AND ft.rate_avg >= 4 AND dmo.sum * 0.07 < 150 THEN 150
+                            WHEN ft.rate_avg < 4.5 AND ft.rate_avg >= 4 AND dmo.sum * 0.07 >= 150 THEN dmo.sum * 0.07
+                            WHEN ft.rate_avg < 4.9 AND ft.rate_avg >= 4.5 AND dmo.sum * 0.08 < 150 THEN 175
+                            WHEN ft.rate_avg < 4.9 AND ft.rate_avg >= 4.5 AND dmo.sum * 0.08 >= 175 THEN dmo.sum * 0.08
+                            WHEN ft.rate_avg >= 4.9 AND dmo.sum * 0.1 < 200 THEN 200
+                            WHEN ft.rate_avg >= 4.9 AND dmo.sum * 0.1 >= 200 THEN dmo.sum * 0.1
+                        END AS courier_order
+                    FROM dds.dm_orders dmo
+                    INNER JOIN dds.dm_timestamps dmt ON dmo.timestamp_id = dmt.id
+                    INNER JOIN dds.dm_couriers dmc ON dmo.courier_id = dmc.id
+                    INNER JOIN full_table_without_order_sum ft ON 
+                        ft.courier_id = dmc.courier_id AND 
+                        dmt.year = ft.settlement_year AND 
+                        dmt.month = ft.settlement_month
+                    WHERE dmo.courier_id IS NOT NULL
+                ),
+                orders_with_fee_summ AS (
+                    SELECT owf.courier_id, owf.settlement_year, owf.settlement_month, SUM(courier_order) AS courier_order_sum
+                    FROM orders_with_fee owf
+                    GROUP BY owf.courier_id, owf.settlement_year, owf.settlement_month
+                ), result AS(
+                SELECT ftwos.courier_id, dmc.name, ftwos.settlement_year, ftwos.settlement_month, ftwos.orders_count, ftwos.orders_total_sum, ftwos.rate_avg,
+                ftwos.order_processing_fee, owfs.courier_order_sum, ftwos.courier_tips_sum, 
+                owfs.courier_order_sum + ftwos.courier_tips_sum * 0.95 AS courier_reward_sum
+                FROM full_table_without_order_sum ftwos
+                INNER JOIN dds.dm_couriers dmc ON ftwos.courier_id = dmc.courier_id
+                INNER JOIN orders_with_fee_summ owfs ON 
+                    owfs.courier_id = ftwos.courier_id AND 
+                    owfs.settlement_year = ftwos.settlement_year AND 
+                    owfs.settlement_month = ftwos.settlement_month
+                )
+                SELECT *
+                FROM result
+            """
+
+            dest_cursor.execute(query, {
+                'year': year,
+                'month': month
+            })
+        else:
+            query = """
+                INSERT INTO cdm.dm_courier_ledger(courier_id, courier_name, settlement_year, settlement_month, orders_count, 
+                orders_total_sum, rate_avg, order_processing_fee, courier_order_sum, courier_tips_sum, courier_reward_sum)
+                WITH full_table_without_order_sum AS(
+                    SELECT dmc.courier_id, dmt.year AS settlement_year, dmt.month AS settlement_month, COUNT(*) AS orders_count, 
+                    SUM(sum) AS orders_total_sum, AVG(rate) AS rate_avg, SUM(sum)*0.25 AS order_processing_fee, SUM(tip_sum) AS courier_tips_sum
+                    FROM dds.dm_orders dmo
+                    INNER JOIN dds.dm_couriers dmc ON dmo.courier_id = dmc.id 
+                    INNER JOIN dds.dm_timestamps dmt ON dmt.id = dmo.timestamp_id 
+                    WHERE dmo.courier_id IS NOT NULL
+                    GROUP BY dmc.courier_id, dmt.year, dmt.month
+                ),
+                orders_with_fee AS(
+                    SELECT dmc.courier_id, ft.settlement_year, ft.settlement_month, dmo.courier_id AS courier_id_int, dmo.sum, ft.rate_avg,
+                        CASE 
+                            WHEN ft.rate_avg < 4 AND dmo.sum * 0.05 < 100 THEN 100
+                            WHEN ft.rate_avg < 4 AND dmo.sum * 0.05 >= 100 THEN dmo.sum * 0.05
+                            WHEN ft.rate_avg < 4.5 AND ft.rate_avg >= 4 AND dmo.sum * 0.07 < 150 THEN 150
+                            WHEN ft.rate_avg < 4.5 AND ft.rate_avg >= 4 AND dmo.sum * 0.07 >= 150 THEN dmo.sum * 0.07
+                            WHEN ft.rate_avg < 4.9 AND ft.rate_avg >= 4.5 AND dmo.sum * 0.08 < 150 THEN 175
+                            WHEN ft.rate_avg < 4.9 AND ft.rate_avg >= 4.5 AND dmo.sum * 0.08 >= 175 THEN dmo.sum * 0.08
+                            WHEN ft.rate_avg >= 4.9 AND dmo.sum * 0.1 < 200 THEN 200
+                            WHEN ft.rate_avg >= 4.9 AND dmo.sum * 0.1 >= 200 THEN dmo.sum * 0.1
+                        END AS courier_order
+                    FROM dds.dm_orders dmo
+                    INNER JOIN dds.dm_timestamps dmt ON dmo.timestamp_id = dmt.id
+                    INNER JOIN dds.dm_couriers dmc ON dmo.courier_id = dmc.id
+                    INNER JOIN full_table_without_order_sum ft ON 
+                        ft.courier_id = dmc.courier_id AND 
+                        dmt.year = ft.settlement_year AND 
+                        dmt.month = ft.settlement_month
+                    WHERE dmo.courier_id IS NOT NULL
+                ),
+                orders_with_fee_summ AS (
+                    SELECT owf.courier_id, owf.settlement_year, owf.settlement_month, SUM(courier_order) AS courier_order_sum
+                    FROM orders_with_fee owf
+                    GROUP BY owf.courier_id, owf.settlement_year, owf.settlement_month
+                ), result AS(
+                SELECT ftwos.courier_id, dmc.name, ftwos.settlement_year, ftwos.settlement_month, ftwos.orders_count, ftwos.orders_total_sum, ftwos.rate_avg,
+                ftwos.order_processing_fee, owfs.courier_order_sum, ftwos.courier_tips_sum, 
+                owfs.courier_order_sum + ftwos.courier_tips_sum * 0.95 AS courier_reward_sum
+                FROM full_table_without_order_sum ftwos
+                INNER JOIN dds.dm_couriers dmc ON ftwos.courier_id = dmc.courier_id
+                INNER JOIN orders_with_fee_summ owfs ON 
+                    owfs.courier_id = ftwos.courier_id AND 
+                    owfs.settlement_year = ftwos.settlement_year AND 
+                    owfs.settlement_month = ftwos.settlement_month
+                )
+                SELECT *
+                FROM result
+                ON CONFLICT (courier_id, settlement_year, settlement_month) DO UPDATE 
+                SET
+                    courier_name = EXCLUDED.courier_name,
+                    orders_count = EXCLUDED.orders_count,
+                    orders_total_sum = EXCLUDED.orders_total_sum,
+                    rate_avg = EXCLUDED.rate_avg,
+                    order_processing_fee = EXCLUDED.order_processing_fee,
+                    courier_order_sum = EXCLUDED.courier_order_sum,
+                    courier_tips_sum = EXCLUDED.courier_tips_sum,
+                    courier_reward_sum = EXCLUDED.courier_reward_sum;
+            """
+
+            dest_cursor.execute(query)
+
+        query = """
+            INSERT INTO cdm.srv_wf_settings(workflow_key, workflow_settings)
+            VALUES(%(workflow_key)s, %(workflow_settings)s)
+            ON CONFLICT (workflow_key)
+            DO UPDATE SET 
+                workflow_settings = %(workflow_settings)s
+        """
+
+        dest_cursor.execute(query, {
+            'workflow_key': 'dm_courier_ledger',
+            'workflow_settings': json.dumps(True),
+        })
+
+        dest_connection.commit()
+
 default_args = {
     'owner': 'Djammer',
     'retries':2,
@@ -812,7 +1213,6 @@ ranks_download = PythonOperator(
     task_id='rank_load',
     python_callable=download_from_postgres_task,
     task_group=tg1,
-    retries=2,
     dag=dag,
     op_kwargs={
         'bd_name_dst': 'bonussystem_ranks',
@@ -824,7 +1224,6 @@ users_download = PythonOperator(
     task_id='users_load',
     python_callable=download_from_postgres_task,
     task_group=tg1,
-    retries=2,
     dag=dag,
     op_kwargs={
         'bd_name_dst': 'bonussystem_users',
@@ -836,7 +1235,6 @@ outbox_downloar = PythonOperator(
     task_id='outbox_load',
     python_callable=download_from_postgres_incremental,
     task_group=tg1,
-    retries=2,
     dag=dag,
 )
 
@@ -846,7 +1244,6 @@ restaurant_download = PythonOperator(
     task_id='restaurant_load',
     python_callable=download_from_mongo_incremental,
     task_group=tg2,
-    retries=2,
     dag=dag,
     op_kwargs={
         'bd_name_dst': 'ordersystem_restaurants',
@@ -859,7 +1256,6 @@ order_download = PythonOperator(
     task_id='order_load',
     python_callable=download_from_mongo_incremental,
     task_group=tg2,
-    retries=2,
     dag=dag,
     op_kwargs={
         'bd_name_dst': 'ordersystem_orders',
@@ -925,11 +1321,44 @@ product_sales_fct_download = PythonOperator(
     dag=dag,
 )
 
+tg6 = TaskGroup(group_id='reports', dag=dag)
+
 settlement_report_dm_download = PythonOperator(
     task_id='dm_settlement_report_fulfill',
     python_callable=dm_settlements_report_fulfill,
+    task_group=tg6,
     dag=dag
 )
 
-[tg1, tg2] >> tg3 >> tg4 >> product_sales_fct_download >> settlement_report_dm_download
+tg5 = TaskGroup(group_id='download_from_API', dag=dag)
+
+couriers_download = PythonOperator(
+    task_id='couriers_load',
+    python_callable=download_from_api_couriers_task,
+    task_group=tg5,
+    dag=dag,
+)
+
+deliveries_download = PythonOperator(
+    task_id='deliveries_load',
+    python_callable=download_from_api_deliveries_task,
+    task_group=tg5,
+    dag=dag,
+)
+
+couriers_dm_fulfill = PythonOperator(
+    task_id='dm_couriers_fulfill',
+    python_callable=dm_couriers_fulfill,
+    task_group=tg3,
+    dag=dag,
+)
+
+courier_ledger_dm_fulfill = PythonOperator(
+    task_id='dm_courier_ledger_load',
+    python_callable=dm_courier_ledger_fulfill,
+    task_group=tg6,
+    dag=dag,
+)
+
+[tg1, tg2, tg5] >> tg3 >> tg4 >> product_sales_fct_download >> tg6
 

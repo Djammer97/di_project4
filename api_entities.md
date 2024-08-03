@@ -66,7 +66,7 @@ dm_couriers(
 cdm:
 cdm.dm_courier_ledger(
     id SERIAL PRIMARY KEY
-    courier_id INT 
+    courier_id VARCHAR 
     courier_name VARCHAR
     settlement_year INT 
     settlement_month INT 
